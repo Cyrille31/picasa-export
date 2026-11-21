@@ -1,4 +1,4 @@
-# PicasaExport v1.1.0 — CGExcel
+# PicasaExport v1.2.0 — CGExcel
 
 Extrait d'une photothèque **Picasa** (retouches invisibles hors de Picasa) une arborescence ordinaire :
 mêmes dossiers, photos retouchées, originaux en sous-dossier, dates conservées, catalogue des personnes et des favoris.
@@ -11,9 +11,17 @@ En échange, une seule chose vous est demandée, sur l'honneur : faire une bonne
 
 1. Installer Python 3.8+ (python.org, cocher « Add to PATH »).
 2. Placer `picasa_export.py` et `lancer_export.bat` dans un même dossier.
-3. Double-cliquer sur `lancer_export.bat` (installe Pillow et numpy au premier lancement), puis répondre aux deux questions : dossier source, dossier de destination.
+3. Placer ces deux fichiers **en dehors** du dossier des photos (par exemple dans le dossier qui contient `photo` et `photo new`) : tout fichier présent dans la source est copié.
+4. Double-cliquer sur `lancer_export.bat` (installe Pillow et numpy au premier lancement). Trois fenêtres s'ouvrent l'une après l'autre :
+   1. **le dossier des photos** (ex. `photo`) ;
+   2. **la liste de ses sous-dossiers** : sélectionner ceux à exporter (Ctrl+clic pour en ajouter, Maj+clic pour une plage, ex. 2021 à 2025 ; bouton « Tout sélectionner ») — tout leur contenu, sous-dossiers compris, est traité ;
+   3. **le dossier de destination** (ex. `photo new`) : `photo new\2021`, `photo new\2022`… sont créés s'ils manquent, complétés s'ils existent.
 
-En ligne de commande : `python picasa_export.py D:\Photos E:\Photos_export`
+   Un récapitulatif demande confirmation, puis l'export se déroule dans la fenêtre noire. Le catalogue reste unique (`photo new\_Catalogue_Picasa`) : les lignes des dossiers non sélectionnés y sont conservées.
+
+En ligne de commande : `python picasa_export.py D:\Photos E:\Photos_export` (tout le dossier), ou seulement certains sous-dossiers :
+`python picasa_export.py "D:\photo" "D:\photo new" --dossiers "2021;2022;2023;2024;2025"`.
+`--console` pose les questions dans la fenêtre au lieu d'ouvrir des fenêtres de choix.
 
 **Conseil : fermer Picasa pendant l'export, et commencer par un essai :**
 `python picasa_export.py D:\Photos E:\Test --echantillon 20`
@@ -58,6 +66,21 @@ Quand on modifie une photo dans Picasa, seul le `.picasa.ini` du dossier change,
 
 `--ecraser` refait tout.
 
+### Contrôle de la sortie (le catalogue n'est pas cru sur parole)
+
+Une photo n'est considérée comme faite que si **le fichier exporté est réellement présent et est bien celui qui a été écrit**. À l'écriture, le programme relève sa taille, sa date et sa **somme de contrôle SHA-256** (colonnes du catalogue). À chaque relance :
+
+| Constat dans la destination | Ce que fait la relance |
+|---|---|
+| photo exportée absente | refaite (« fichier absent de la sortie ») |
+| taille ou date différente de celles relevées (fichier remplacé, copié d'ailleurs…) | refaite |
+| original absent de `_Originaux_Picasa` (photo retouchée) | refaite |
+| somme de contrôle différente (seulement avec `--controle-complet`, qui relit toutes les photos : plus long) | refaite |
+| extraction faite avec une version antérieure (sans relevé) | une simple copie est vérifiée par sa taille ; une photo retouchée est refaite une fois |
+
+La ligne du catalogue est alors mise à jour, avec le motif dans le statut (« refaite : … »), et la fin du traitement affiche le nombre de photos refaites par motif.
+Colonnes utiles : **« Dernière extraction »** = date à laquelle la photo a été produite ; **« Dernière vérification dans la sortie »** = date de la dernière relance qui l'a contrôlée (une date ancienne signale une ligne d'un dossier non sélectionné depuis).
+
 ## Mémoire
 
 Les grandes images sont traitées par bandes. Le programme mesure la mémoire libre au lancement et découpe davantage si elle manque. C'est utile sur un vieil ordinateur : avec moins de 1,5 Go libres, les images de plus de 2 Mpx sont traitées par bandes. Une photo qui n'a pu être lue est copiée telle quelle et signalée dans le catalogue.
@@ -66,7 +89,7 @@ Les grandes images sont traitées par bandes. Le programme mesure la mémoire li
 
 CSV prêts pour Excel (séparateur `;`, UTF-8) :
 
-- `catalogue_photos.csv` : une ligne par fichier (date, favori, personnes, retouches appliquées, rendu approché, retouches non reproduites, statut) ;
+- `catalogue_photos.csv` : une ligne par fichier (date, favori, personnes, retouches appliquées, rendu approché, retouches non reproduites, statut, date d'extraction, taille et somme de contrôle SHA-256 du fichier exporté, date de dernière vérification) ;
 - `personnes.csv` : **une ligne par personne et par photo**, avec la position du visage (rectangle en fractions et en pixels, dans la photo exportée : recadrage, redressement et rotation pris en compte) et son cadrage (entier / partiel / hors cadre) ;
 - `personnes_resume.csv` : une ligne par personne (nombre de photos et liste) ;
 - `favoris.csv` : photos marquées d'une étoile.
@@ -98,6 +121,6 @@ Si **exiftool** est installé (dans le PATH), les noms des personnes et les favo
 
 ## Options
 
-`--sans-originaux`, `--sous-dossier-originaux NOM`, `--rejouer` (rejoue aussi les yeux rouges/retouches déjà cuits : déconseillé), `--qualite 95`, `--ecraser`, `--echantillon N`, `--simulation`, `--contacts CHEMIN`, `--sans-exiftool`, `--sans-verification`, `--sans-reconstruction`, `--apropos`.
+`--sans-originaux`, `--sous-dossier-originaux NOM`, `--rejouer` (rejoue aussi les yeux rouges/retouches déjà cuits : déconseillé), `--qualite 95`, `--ecraser`, `--echantillon N`, `--simulation`, `--contacts CHEMIN`, `--sans-exiftool`, `--sans-verification`, `--sans-reconstruction`, `--dossiers "A;B"` (seulement ces sous-dossiers de la source), `--controle-complet` (vérifie la somme de contrôle de chaque photo déjà exportée), `--console` (questions dans la fenêtre plutôt que fenêtres de choix), `--apropos`.
 
 Sans `--ecraser`, seul ce qui a changé est refait (voir « Relance incrémentale »).

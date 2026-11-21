@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PicasaExport v1.1.0
+PicasaExport v1.2.0
 ===================
 Marque       : CGExcel
 Auteur       : Cyrille Gindre
@@ -42,7 +42,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 PHRASE_BAL = ("En échange, une seule chose vous est demandée, sur l'honneur : faire une bonne "
               "action chaque jour. Aider un voisin, sourire à un inconnu, ramasser un papier… "
@@ -907,6 +907,47 @@ def liste_dossier(dossier):
     return res
 
 
+def empreinte_fichier(chemin):
+    """Somme de contrôle SHA-256 d'un fichier (lecture par blocs de 1 Mo)."""
+    h = hashlib.sha256()
+    with open(chemin, "rb") as f:
+        for bloc in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloc)
+    return h.hexdigest()
+
+
+def releve_sortie(chemin):
+    """[taille, date de modification, SHA-256] du fichier exporté, tels qu'enregistrés sur le disque de sortie.
+    Juste après l'écriture, le fichier est encore en mémoire cache : la somme de contrôle ne coûte presque rien."""
+    stt = os.stat(chemin)
+    return [stt.st_size, int(stt.st_mtime), empreinte_fichier(chemin)]
+
+
+def normaliser_selection(dossiers):
+    """Liste de sous-dossiers (relatifs à la source) → tuple de chemins en minuscules, séparateur « / »."""
+    res = []
+    for d in dossiers or []:
+        d = d.strip().strip('"').replace("\\", "/").strip("/")
+        if d and d != ".":
+            res.append(d.lower())
+    return tuple(res)
+
+
+def position_selection(rel, selection):
+    """Situe un dossier (chemin relatif à la source) par rapport aux sous-dossiers choisis :
+    « dedans » (à traiter), « chemin » (à parcourir pour atteindre un dossier choisi) ou « hors »."""
+    if not selection:
+        return "dedans"
+    r = rel.replace("\\", "/").strip("/").lower()
+    for s in selection:
+        if r == s or r.startswith(s + "/"):
+            return "dedans"
+    for s in selection:
+        if r == "" or s.startswith(r + "/"):
+            return "chemin"
+    return "hors"
+
+
 def signature_rendu(st, sec, sauvegarde):
     """Empreinte de ce qui détermine la photo exportée : taille + date du fichier, réglages Picasa de CETTE photo
     (sa section [nom] du .picasa.ini, hors personnes/étoile/légende) et original sauvegardé. Picasa n'écrit
@@ -1106,7 +1147,17 @@ def executer(a):
     regler_memoire()
     exiftool = None if a.sans_exiftool else shutil.which("exiftool")
     glob_id, glob_focus = contacts_globaux(a.contacts)
+    selection = normaliser_selection(getattr(a, "dossiers", None))
+    for s in selection:
+        if not os.path.isdir(os.path.join(src_root, *s.split("/"))):
+            print(f"Sous-dossier introuvable dans la source : {s}")
+            return 1
     print(f"Source : {src_root}\nSortie : {dst_root}")
+    if selection:
+        print(f"Sous-dossiers traités ({len(selection)}) : " + ", ".join(a.dossiers))
+        print("  (les autres dossiers ne sont pas touchés ; leurs lignes du catalogue sont conservées)")
+    if a.controle_complet:
+        print("Contrôle complet : la somme de contrôle de chaque photo exportée est recalculée (plus long).")
     print(f"exiftool : {'oui' if exiftool else 'non (personnes/favoris seulement dans le catalogue)'}")
     print(f"Noms de contacts globaux lus (contacts.xml) : {len(glob_id)}")
     if a.simulation:
@@ -1133,6 +1184,7 @@ def executer(a):
     etat = {}
     maintenant = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_nouveaux = n_maj = n_inchanges = n_reprises = n_catalogue = 0
+    motifs_reprise = defaultdict(int)
 
     lignes = []
     par_personne = defaultdict(list)
@@ -1157,16 +1209,21 @@ def executer(a):
 
     try:
         for racine, dossiers, _fichiers in os.walk(src_root):
-            dossiers[:] = sorted(d for d in dossiers if d.lower() not in DOSSIERS_IGNORES)
             rel = os.path.relpath(racine, src_root)
             rel = "" if rel == "." else rel
+            dossiers[:] = sorted(d for d in dossiers if d.lower() not in DOSSIERS_IGNORES and
+                                 position_selection(os.path.join(rel, d), selection) != "hors")
+            if position_selection(rel, selection) != "dedans":
+                continue        # dossier seulement traversé pour atteindre un sous-dossier choisi
             sections, contacts_loc, liens = lire_ini(racine)
             contacts = noms_du_dossier(contacts_loc, liens, glob_id, glob_focus)
             dest_dir = os.path.join(dst_root, rel)
             # une seule lecture de chaque dossier (source et sortie) : sous Windows, la date et la taille
             # des fichiers sont fournies avec la liste, sans accès supplémentaire au disque
             entrees = liste_dossier(racine)
-            deja_en_sortie = set(liste_dossier(dest_dir))
+            deja_en_sortie = liste_dossier(dest_dir)
+            dir_originaux = os.path.join(dest_dir, a.sous_dossier_originaux)
+            originaux_en_sortie = None      # lu seulement si besoin
 
             for nom in sorted(entrees):
                 st = entrees[nom]
@@ -1212,6 +1269,11 @@ def executer(a):
                 r_prec = (prec or {}).get("row") or []
 
                 # ---- que faire de ce fichier ?
+                # Le catalogue n'est pas cru sur parole : la photo exportée doit être présente ET être
+                # exactement celle qui a été écrite (taille et date relevées à l'écriture, somme de contrôle
+                # SHA-256 avec --controle-complet). Sinon elle est refaite.
+                rel_sortie = prec.get("sortie") if prec else None
+                vu_sortie = deja_en_sortie.get(nom)
                 if a.ecraser or not prec or not r_prec:
                     action, motif = "nouveau", ""
                 elif nom not in deja_en_sortie:
@@ -1220,8 +1282,26 @@ def executer(a):
                     action, motif = "maj", ""
                 elif str(r_prec[10]).startswith("ERREUR") or "(erreur" in str(r_prec[8]):
                     action, motif = "refaire", "erreur lors de l'extraction précédente"
+                elif rel_sortie and (vu_sortie is None or list(vu_sortie) != list(rel_sortie[:2])):
+                    action, motif = "refaire", "fichier de sortie différent de celui enregistré (taille ou date)"
+                elif not rel_sortie and (modifiee or vu_sortie is None or vu_sortie[0] != st[0]):
+                    # extraction faite par une version antérieure (sans relevé de la sortie) : une simple copie
+                    # se vérifie par sa taille, une photo retouchée ne peut pas être vérifiée → refaite
+                    action, motif = "refaire", "photo exportée invérifiable (extraction d'une version antérieure)"
                 else:
                     action, motif = "inchange", ""
+                    if a.controle_complet and rel_sortie and len(rel_sortie) > 2:
+                        try:
+                            if empreinte_fichier(dst) != rel_sortie[2]:
+                                action, motif = "refaire", "somme de contrôle différente"
+                        except OSError:
+                            action, motif = "refaire", "fichier de sortie illisible"
+                if action == "inchange" and a.originaux and modifiee:
+                    if originaux_en_sortie is None:
+                        originaux_en_sortie = liste_dossier(dir_originaux)
+                    if nom not in originaux_en_sortie:
+                        action, motif = "refaire", "original absent de " + a.sous_dossier_originaux
+                sortie_info = rel_sortie if action == "inchange" else None
 
                 idx_visages = len(lignes_visages)
                 statut, appliques, approches, ignores = "copiée", [], [], []
@@ -1233,6 +1313,9 @@ def executer(a):
                         if exiftool and est_image and not a.simulation and \
                                 (prec.get("personnes") != personnes or r_prec[2] != ("oui" if favori else "non")):
                             marquer_exiftool(exiftool, dst, personnes, favori)
+                            sortie_info = None          # le fichier a changé : nouveau relevé
+                        if not a.simulation and not sortie_info:
+                            sortie_info = releve_sortie(dst)   # (version antérieure : copie vérifiée par sa taille)
                     else:
                         a_rendre = bool(filtres or rotation)
                         if est_image and ext in (".jpg", ".jpeg") and a.verifier:
@@ -1274,13 +1357,11 @@ def executer(a):
                                 if dommage:
                                     statut += " — fichier source abîmé, non réparable"
                             if a.originaux and modifiee:
-                                orig_dir = os.path.join(dest_dir, a.sous_dossier_originaux)
-                                os.makedirs(orig_dir, exist_ok=True)
-                                orig_dst = os.path.join(orig_dir, nom)
-                                if action != "inchange" or not os.path.exists(orig_dst):
-                                    copier_fichier(sauvegarde or src, orig_dst)
+                                os.makedirs(dir_originaux, exist_ok=True)
+                                copier_fichier(sauvegarde or src, os.path.join(dir_originaux, nom))
                             if exiftool and est_image:
                                 marquer_exiftool(exiftool, dst, personnes, favori)
+                            sortie_info = releve_sortie(dst)
                         else:
                             if a_rendre:
                                 appliques = [f[0] for f in filtres if f[0] in FILTRES]
@@ -1297,6 +1378,7 @@ def executer(a):
                             os.makedirs(dest_dir, exist_ok=True)
                             copier_fichier(src, dst)
                             statut += " (fichier copié tel quel)"
+                            sortie_info = releve_sortie(dst)
                         except Exception:  # noqa: BLE001
                             pass
 
@@ -1324,12 +1406,19 @@ def executer(a):
                         ligne_cat += [maintenant, n_maj_prec + 1, maintenant]
                     elif action == "refaire":
                         n_reprises += 1
+                        motifs_reprise[motif] += 1
                         ligne_cat[10] += f" (refaite : {motif})"
                         ligne_cat += [maintenant, n_maj_prec, der_maj_prec]
                     else:
                         n_nouveaux += 1
                         ligne_cat += [maintenant, 0, ""]
                     ligne_cat.append(integrite)
+                # colonnes de contrôle : ce qui a été trouvé dans la sortie, et quand
+                ligne_cat = (list(ligne_cat) + [""] * 15)[:15]
+                if sortie_info:
+                    ligne_cat += [sortie_info[0], sortie_info[2] if len(sortie_info) > 2 else "", maintenant]
+                else:
+                    ligne_cat += ["", "", ""]
                 lignes.append(ligne_cat)
                 for p in personnes:
                     par_personne[p].append(chemin_rel)
@@ -1370,7 +1459,8 @@ def executer(a):
                     favoris.append((chemin_rel, date, "; ".join(personnes)))
                 if statut != "(simulation)":
                     etat[cle] = {"sig": sig, "row": ligne_cat, "faces": visages_bruts,
-                                 "visages": lignes_visages[idx_visages:], "personnes": personnes}
+                                 "visages": lignes_visages[idx_visages:], "personnes": personnes,
+                                 "sortie": sortie_info}
                 elif prec:
                     etat[cle] = prec
 
@@ -1400,7 +1490,9 @@ def executer(a):
         ecrire_csv(os.path.join(cat, "catalogue_photos.csv"),
                    ["Chemin", "Date", "Favori", "Personnes", "Retouchée", "Original sauvegardé par Picasa",
                     "Retouches appliquées", "Rendu approché", "Retouches non reproduites", "Légende", "Statut",
-                    "Dernière extraction", "Nombre de mises à jour", "Dernière mise à jour", "Intégrité du fichier source"],
+                    "Dernière extraction", "Nombre de mises à jour", "Dernière mise à jour", "Intégrité du fichier source",
+                    "Taille du fichier exporté (octets)", "Somme de contrôle SHA-256 du fichier exporté",
+                    "Dernière vérification dans la sortie"],
                    lignes)
         abimees = [[l[0], l[14], l[10]] for l in lignes if len(l) > 14 and str(l[14]).startswith("ENDOMMAGÉE")]
         ecrire_csv(os.path.join(cat, "photos_endommagees.csv"), ["Chemin", "Diagnostic", "Statut"], abimees)
@@ -1424,12 +1516,21 @@ def executer(a):
                     "(visage coupé ou exclu par un recadrage ; pas de rectangle dans ce dernier cas). "
                     "personnes_resume.csv : une ligne par personne avec la liste de ses photos.\n"
                     "\netat_export.json : mémoire de l'extraction, utilisée pour ne refaire que ce qui a changé "
-                    "à la relance. Le supprimer revient à tout refaire.\n")
+                    "à la relance. Le supprimer revient à tout refaire.\n"
+                    "\nContrôle de la sortie : à chaque relance, le programme ne se fie pas au catalogue. Une photo "
+                    "n'est considérée comme faite que si le fichier exporté est présent et a la taille et la date "
+                    "relevées lors de son écriture (avec --controle-complet : la même somme de contrôle SHA-256). "
+                    "Sinon elle est refaite et sa ligne mise à jour. Colonnes : « Dernière extraction » = date à "
+                    "laquelle la photo a été produite ; « Dernière vérification dans la sortie » = date de la "
+                    "dernière relance qui a constaté sa présence. Une date de vérification ancienne signale une ligne "
+                    "qui n'a pas été revue (dossier non sélectionné lors des dernières relances).\n")
 
     duree = time.time() - t0
     print("\n=== Interrompu (relancer pour reprendre) ===" if interrompu else "\n=== Terminé ===")
     print(f"Nouveaux : {n_nouveaux} | inchangés : {n_inchanges} | modifiés dans Picasa : {n_maj} | "
           f"refaits : {n_reprises} | seulement personnes/favori/légende : {n_catalogue}")
+    for m, n in sorted(motifs_reprise.items(), key=lambda x: -x[1]):
+        print(f"  refaits — {m} : {n}")
     print(f"Fichiers : {n_total} | retouchés : {n_modif} | personnes : {len(par_personne)} | "
           f"favoris : {len(favoris)} | erreurs : {n_erreurs} | durée : {duree:.0f} s")
     if not a.simulation:
@@ -1470,6 +1571,12 @@ def main():
     p.add_argument("--sans-reconstruction", dest="reconstruire", action="store_false",
                    help="ne pas compléter les photos abîmées avec leur miniature intégrée")
     p.add_argument("--simulation", action="store_true", help="ne rien écrire, juste compter")
+    p.add_argument("--dossiers", metavar="LISTE",
+                   help="ne traiter que ces sous-dossiers de la source, séparés par « ; » (ex. \"2021;2022;2023\")")
+    p.add_argument("--controle-complet", action="store_true",
+                   help="vérifier aussi la somme de contrôle SHA-256 de chaque photo déjà exportée (relit tout)")
+    p.add_argument("--console", action="store_true",
+                   help="poser les questions dans la fenêtre de commande plutôt qu'avec des fenêtres de choix")
     p.add_argument("--apropos", action="store_true", help="afficher la version et la licence")
     a = p.parse_args()
 
@@ -1477,11 +1584,120 @@ def main():
         print(APROPOS)
         return 0
     print(APROPOS + "\n")
+    a.dossiers = [d for d in (a.dossiers or "").split(";") if d.strip()]
     if not a.source:
-        a.source = input("Dossier source (photos Picasa) : ").strip().strip('"')
+        choix = None if a.console else choisir_par_fenetres()
+        if choix == "annule":
+            print("Annulé.")
+            return 1
+        if choix:
+            a.source, a.dossiers, a.sortie = choix
+        else:
+            a.source = input("Dossier source (photos Picasa) : ").strip().strip('"')
+            rep = input("Sous-dossiers à traiter, séparés par ; (Entrée = tous) : ").strip()
+            a.dossiers = [d for d in rep.split(";") if d.strip()]
     if not a.sortie:
         a.sortie = input("Dossier de destination        : ").strip().strip('"')
     return executer(a)
+
+
+def choisir_par_fenetres():
+    """Trois étapes : dossier des photos, sous-dossiers à traiter (liste à cocher), dossier de destination.
+    Renvoie (source, [sous-dossiers], destination), « annule », ou None si les fenêtres sont indisponibles."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+        racine_tk = tk.Tk()
+    except Exception:  # noqa: BLE001  (pas de tkinter, pas d'écran…)
+        return None
+    racine_tk.withdraw()
+    try:
+        source = filedialog.askdirectory(parent=racine_tk, mustexist=True,
+                                         title="1/3 — Dossier des photos Picasa (ex. « photo »)")
+        if not source:
+            return "annule"
+        source = os.path.normpath(source)
+        try:
+            sous = sorted((d for d in os.listdir(source)
+                           if os.path.isdir(os.path.join(source, d)) and not d.startswith(".")
+                           and d.lower() not in DOSSIERS_IGNORES), key=str.lower)
+        except OSError:
+            sous = []
+
+        choisis = []
+        if sous:
+            fen = tk.Toplevel(racine_tk)
+            fen.title("2/3 — Sous-dossiers à exporter")
+            fen.attributes("-topmost", True)
+            tk.Label(fen, justify="left", anchor="w",
+                     text=f"Dans « {source} »,\nchoisissez les dossiers à exporter (tout leur contenu est traité).\n"
+                          "Clic = un dossier, Ctrl+clic = ajouter/retirer, Maj+clic = une plage.").pack(
+                fill="x", padx=12, pady=(12, 6))
+            cadre = tk.Frame(fen)
+            cadre.pack(fill="both", expand=True, padx=12)
+            barre = tk.Scrollbar(cadre)
+            liste = tk.Listbox(cadre, selectmode="extended", height=min(20, max(8, len(sous))), width=50,
+                               exportselection=False, yscrollcommand=barre.set)
+            barre.config(command=liste.yview)
+            barre.pack(side="right", fill="y")
+            liste.pack(side="left", fill="both", expand=True)
+            for d in sous:
+                liste.insert("end", d)
+            resultat = {"ok": False}
+            compteur = tk.Label(fen, anchor="w", text="0 dossier sélectionné")
+            compteur.pack(fill="x", padx=12, pady=4)
+
+            def maj_compteur(_e=None):
+                n = len(liste.curselection())
+                compteur.config(text=f"{n} dossier{'s' if n > 1 else ''} sélectionné{'s' if n > 1 else ''}")
+
+            def valider():
+                if not liste.curselection():
+                    messagebox.showwarning("Aucun dossier", "Sélectionnez au moins un dossier.", parent=fen)
+                    return
+                resultat["ok"] = True
+                resultat["choix"] = [sous[i] for i in liste.curselection()]
+                fen.destroy()
+
+            liste.bind("<<ListboxSelect>>", maj_compteur)
+            boutons = tk.Frame(fen)
+            boutons.pack(fill="x", padx=12, pady=(4, 12))
+            tk.Button(boutons, text="Tout sélectionner",
+                      command=lambda: (liste.select_set(0, "end"), maj_compteur())).pack(side="left")
+            tk.Button(boutons, text="Rien",
+                      command=lambda: (liste.select_clear(0, "end"), maj_compteur())).pack(side="left", padx=6)
+            tk.Button(boutons, text="Annuler", command=fen.destroy).pack(side="right")
+            tk.Button(boutons, text="Valider", default="active", command=valider).pack(side="right", padx=6)
+            fen.protocol("WM_DELETE_WINDOW", fen.destroy)
+            fen.grab_set()
+            fen.wait_window()
+            if not resultat["ok"]:
+                return "annule"
+            choisis = resultat["choix"]
+        while True:
+            sortie = filedialog.askdirectory(parent=racine_tk, initialdir=os.path.dirname(source),
+                                             title="3/3 — Dossier de destination (ex. « photo new »)")
+            if not sortie:
+                return "annule"
+            sortie = os.path.normpath(sortie)
+            nc_s, nc_d = os.path.normcase(source), os.path.normcase(sortie)
+            if nc_d == nc_s or nc_d.startswith(nc_s + os.sep):
+                messagebox.showerror("Destination impossible",
+                                     "La destination ne doit pas être le dossier des photos ni l'un de ses "
+                                     "sous-dossiers. Choisissez par exemple « photo new », à côté.")
+                continue
+            break
+        resume = (f"Source : {source}\n"
+                  f"Dossiers : {', '.join(choisis) if choisis else 'tout le dossier'}\n"
+                  f"Destination : {sortie}\n\n"
+                  + "\n".join(f"   {os.path.join(sortie, d)}" for d in choisis[:12])
+                  + ("\n   …" if len(choisis) > 12 else "")
+                  + "\n\nLes dossiers manquants seront créés, ceux qui existent seront complétés.\nLancer l'export ?")
+        if not messagebox.askyesno("Confirmer l'export", resume):
+            return "annule"
+        return source, choisis, sortie
+    finally:
+        racine_tk.destroy()
 
 
 if __name__ == "__main__":
